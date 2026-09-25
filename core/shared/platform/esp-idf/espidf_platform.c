@@ -75,13 +75,10 @@ os_time_thread_cputime_us(void)
 uint8 *
 os_thread_get_stack_boundary(void)
 {
-#if defined(CONFIG_FREERTOS_USE_TRACE_FACILITY)
-    TaskStatus_t pxTaskStatus;
-    vTaskGetInfo(xTaskGetCurrentTaskHandle(), &pxTaskStatus, pdTRUE, eInvalid);
-    return pxTaskStatus.pxStackBase;
-#else // !defined(CONFIG_FREERTOS_USE_TRACE_FACILITY)
-    return NULL;
-#endif
+    /* The lowest address of the calling task's stack. Every FreeRTOS task on
+       ESP-IDF has one to report, so the runtime's native stack check is real
+       without the trace facility. */
+    return pxTaskGetStackStart(xTaskGetCurrentTaskHandle());
 }
 
 void

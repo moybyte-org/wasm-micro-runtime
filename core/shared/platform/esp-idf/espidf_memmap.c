@@ -5,94 +5,81 @@
 
 #include "platform_api_vmcore.h"
 #include "platform_api_extension.h"
-#if CONFIG_IDF_TARGET_ESP32P4
-#include "esp_cache.h"   /* Moybyte #158 */
+#if WASM_ESPIDF_EXEC_IN_PSRAM != 0
+#include "esp_cache.h"
 #endif
 #if (WASM_MEM_DUAL_BUS_MIRROR != 0)
-#include "soc/mmu.h"
-#include "rom/cache.h"
+#include "soc/soc.h"
 
-/* Moybyte #158: PSRAM at data address D is fetched as instructions at
- * D + (SOC_IROM_LOW - SOC_DROM_LOW) -- the S3 MMU serves both buses from
- * one table. Upstream's (SOC_IROM_LOW - SOC_IROM_HIGH) lands outside every
- * mapped range on IDF 5.5. */
+/* PSRAM at data address D is fetched as instructions at
+ * D + (SOC_IROM_LOW - SOC_DROM_LOW): the S3 MMU serves both buses from one
+ * table. (SOC_IROM_LOW - SOC_IROM_HIGH) lands outside every mapped range on
+ * IDF 5.5. */
 #define MEM_DUAL_BUS_OFFSET (SOC_IROM_LOW - SOC_DROM_LOW)
 
 #define in_ibus_ext(addr) \
     (((uint32)addr >= SOC_IROM_LOW) && ((uint32)addr < SOC_IROM_HIGH))
-
-static portMUX_TYPE s_spinlock = portMUX_INITIALIZER_UNLOCKED;
 #endif
+
+/* Where a mapping comes from, on a board with PSRAM:
+ *
+ * - Executable memory (AOT text) is PSRAM on the ESP32-S3, fetched through
+ *   the instruction-bus alias, and on the ESP32-P4, whose external RAM
+ *   carries no PMP entry. A load PSRAM cannot serve FAILS: it is never
+ *   served from the internal exec heap, which on these boards is the same
+ *   SRAM WiFi, BLE and the display's DMA live on.
+ * - Data mappings (linear memory, AOT data sections) of
+ *   WASM_ESPIDF_PSRAM_THRESHOLD bytes or more are PSRAM only, and fail the
+ *   same way; smaller ones take the heap's default order.
+ *
+ * Other targets keep the internal exec heap. */
+static uint32_t
+mmap_caps(size_t size, int prot)
+{
+    if (prot & MMAP_PROT_EXEC) {
+#if WASM_ESPIDF_EXEC_IN_PSRAM != 0
+        return MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+#else
+        return MALLOC_CAP_EXEC;
+#endif
+    }
+#if CONFIG_SPIRAM
+    if (size >= WASM_ESPIDF_PSRAM_THRESHOLD) {
+        return MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    }
+#endif
+    (void)size;
+    return MALLOC_CAP_8BIT;
+}
 
 void *
 os_mmap(void *hint, size_t size, int prot, int flags, os_file_handle file)
 {
+    /* heap_caps_malloc returns 4-byte aligned blocks: reserve room to align
+       to 8 and to keep the originally allocated address just below the
+       returned one, where os_free finds it. */
+    void *buf_origin =
+        heap_caps_malloc(size + 4 + sizeof(uintptr_t), mmap_caps(size, prot));
+    if (!buf_origin) {
+        return NULL;
+    }
+    void *buf_fixed = buf_origin + sizeof(void *);
+    if ((uintptr_t)buf_fixed & (uintptr_t)0x7) {
+        buf_fixed = (void *)((uintptr_t)(buf_fixed + 4) & (~(uintptr_t)7));
+    }
+
+    uintptr_t *addr_field = buf_fixed - sizeof(uintptr_t);
+    *addr_field = (uintptr_t)buf_origin;
+
+    /* Cleared through the data bus: the S3's instruction alias is fetch-only
+       (a store through it is StoreProhibited). */
+    memset(buf_fixed, 0, size);
+#if (WASM_MEM_DUAL_BUS_MIRROR != 0)
     if (prot & MMAP_PROT_EXEC) {
-#if (WASM_MEM_DUAL_BUS_MIRROR != 0)
-        uint32_t mem_caps = MALLOC_CAP_SPIRAM;
-#elif CONFIG_IDF_TARGET_ESP32P4
-        /* Moybyte #158: PSRAM carries no PMP entry on the P4, so it is RWX; the
-         * internal exec heap is the fallback (present only with
-         * CONFIG_ESP_SYSTEM_PMP_IDRAM_SPLIT=n). */
-        uint32_t mem_caps = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > size + 64
-                                ? MALLOC_CAP_SPIRAM : MALLOC_CAP_EXEC;
-        os_printf("WAMR exec mmap %u bytes from %s\n", (unsigned)size,
-                  mem_caps == MALLOC_CAP_SPIRAM ? "PSRAM" : "internal exec heap");
-#else
-        uint32_t mem_caps = MALLOC_CAP_EXEC;
-#endif
-
-        // Memory allocation with MALLOC_CAP_EXEC will return 4-byte aligned
-        // Reserve extra 4 byte to fixup alignment and size for the pointer to
-        // the originally allocated address
-        void *buf_origin =
-            heap_caps_malloc(size + 4 + sizeof(uintptr_t), mem_caps);
-        if (!buf_origin) {
-            return NULL;
-        }
-        void *buf_fixed = buf_origin + sizeof(void *);
-        if ((uintptr_t)buf_fixed & (uintptr_t)0x7) {
-            buf_fixed = (void *)((uintptr_t)(buf_fixed + 4) & (~(uintptr_t)7));
-        }
-
-        uintptr_t *addr_field = buf_fixed - sizeof(uintptr_t);
-        *addr_field = (uintptr_t)buf_origin;
-#if (WASM_MEM_DUAL_BUS_MIRROR != 0)
-        /* Moybyte #158: the instruction-bus mirror is fetch-only on the S3
-         * (a store through it is StoreProhibited); clear via the data bus. */
-        memset(buf_fixed, 0, size);
         return buf_fixed + MEM_DUAL_BUS_OFFSET;
-#else
-        memset(buf_fixed, 0, size);
-        return buf_fixed;
-#endif
     }
-    else {
-#if (WASM_MEM_DUAL_BUS_MIRROR != 0)
-        uint32_t mem_caps = MALLOC_CAP_SPIRAM;
-#else
-        uint32_t mem_caps = MALLOC_CAP_8BIT;
 #endif
-        void *buf_origin =
-            heap_caps_malloc(size + 4 + sizeof(uintptr_t), mem_caps);
-        if (!buf_origin) {
-            return NULL;
-        }
-
-        // Memory allocation with MALLOC_CAP_SPIRAM or MALLOC_CAP_8BIT will
-        // return 4-byte aligned Reserve extra 4 byte to fixup alignment and
-        // size for the pointer to the originally allocated address
-        void *buf_fixed = buf_origin + sizeof(void *);
-        if ((uintptr_t)buf_fixed & (uintptr_t)0x7) {
-            buf_fixed = (void *)((uintptr_t)(buf_fixed + 4) & (~(uintptr_t)7));
-        }
-
-        uintptr_t *addr_field = buf_fixed - sizeof(uintptr_t);
-        *addr_field = (uintptr_t)buf_origin;
-
-        memset(buf_fixed, 0, size);
-        return buf_fixed;
-    }
+    return buf_fixed;
 }
 
 void *
@@ -123,38 +110,55 @@ os_mprotect(void *addr, size_t size, int prot)
 }
 
 void
-#if (WASM_MEM_DUAL_BUS_MIRROR != 0)
-    IRAM_ATTR
-#endif
-    os_dcache_flush()
+os_dcache_flush()
 {
-#if (WASM_MEM_DUAL_BUS_MIRROR != 0)
-    uint32_t preload;
-    extern void Cache_WriteBack_All(void);
-
-    portENTER_CRITICAL(&s_spinlock);
-
-    Cache_WriteBack_All();
-    preload = Cache_Disable_ICache();
-    Cache_Enable_ICache(preload);
-
-    portEXIT_CRITICAL(&s_spinlock);
-#endif
+    /* Nothing to do here: the loader calls os_icache_flush over the text
+       after copying it and again once its relocations are applied, and that
+       sync is scoped to the text's own range. A whole-cache write-back would
+       need the instruction cache disabled, which faults the other core if it
+       is executing from flash or PSRAM at that moment -- and on a console it
+       always is. */
 }
+
+/* One cache line on every target this file syncs (the S3's 32 B and the P4's
+   64 B lines both divide it), so an aligned range is aligned for both. */
+#define CACHE_SYNC_ALIGN 64
 
 void
 os_icache_flush(void *start, size_t len)
 {
-#if CONFIG_IDF_TARGET_ESP32P4
-    /* Moybyte #158: the text was written through the data cache; push it out and
-     * drop whatever the instruction cache holds for that range. */
-    if (start && len) {
-        uintptr_t a = (uintptr_t)start & ~(uintptr_t)63;   /* 64 B lines; M2C wants aligned */
-        size_t n = (((uintptr_t)start + len + 63) & ~(uintptr_t)63) - a;
-        esp_cache_msync((void *)a, n, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-        esp_cache_msync((void *)a, n, ESP_CACHE_MSYNC_FLAG_DIR_M2C | ESP_CACHE_MSYNC_FLAG_TYPE_INST);
-        __asm__ volatile("fence.i" ::: "memory");
+#if WASM_ESPIDF_EXEC_IN_PSRAM != 0
+    /* The text was written through the data cache. Write that range back
+       (C2M) and drop whatever the instruction cache holds for it (M2C, INST).
+       Both are range operations under IDF's cross-core cache lock, so they
+       are safe while the other core runs; neither disables a cache. */
+    if (!start || !len) {
+        return;
     }
+    uintptr_t ibus = (uintptr_t)start & ~(uintptr_t)(CACHE_SYNC_ALIGN - 1);
+    size_t n = (((uintptr_t)start + len + CACHE_SYNC_ALIGN - 1)
+                & ~(uintptr_t)(CACHE_SYNC_ALIGN - 1))
+               - ibus;
+#if (WASM_MEM_DUAL_BUS_MIRROR != 0)
+    /* The bus aliases differ by a page-aligned constant, so the data range
+       aligns exactly as the instruction one does. */
+    uintptr_t dbus =
+        (uintptr_t)os_get_dbus_mirror(start) - ((uintptr_t)start - ibus);
+#else
+    uintptr_t dbus = ibus;
+#endif
+    if (esp_cache_msync((void *)dbus, n, ESP_CACHE_MSYNC_FLAG_DIR_C2M)
+            != ESP_OK
+        || esp_cache_msync((void *)ibus, n,
+                           ESP_CACHE_MSYNC_FLAG_DIR_M2C
+                               | ESP_CACHE_MSYNC_FLAG_TYPE_INST)
+               != ESP_OK) {
+        os_printf("WAMR: cache sync failed for text at %p (+%u)\n", start,
+                  (unsigned)len);
+    }
+#if CONFIG_IDF_TARGET_ARCH_RISCV
+    __asm__ volatile("fence.i" ::: "memory");
+#endif
 #else
     (void)start;
     (void)len;
@@ -162,8 +166,8 @@ os_icache_flush(void *start, size_t len)
 }
 
 #if (WASM_MEM_DUAL_BUS_MIRROR != 0)
-/* Moybyte #158: one flash partition mapped twice -- ESP_PARTITION_MMAP_DATA for
- * the loader's reads, ESP_PARTITION_MMAP_INST for execution. */
+/* One flash partition mapped twice: ESP_PARTITION_MMAP_DATA for the loader's
+ * reads, ESP_PARTITION_MMAP_INST for execution. */
 static const char *s_xip_dbus, *s_xip_ibus;
 static size_t s_xip_size;
 

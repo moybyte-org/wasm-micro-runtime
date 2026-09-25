@@ -4366,11 +4366,16 @@ create_sections(AOTModule *module, const uint8 *buf, uint32 size,
                     }
 
 #if (WASM_MEM_DUAL_BUS_MIRROR != 0)
+                    /* Written through the data bus (the instruction alias is
+                       fetch-only), and made visible on the instruction bus at
+                       once: load_text_section reads the text back through
+                       that alias, before any relocation. os_mmap cleared the
+                       padding, so there is nothing to store past the copy. */
                     mirrored_text = os_get_dbus_mirror(aot_text);
                     bh_assert(mirrored_text != NULL);
                     bh_memcpy_s(mirrored_text, (uint32)total_size,
                                 section->section_body, (uint32)section_size);
-                    os_dcache_flush();
+                    os_icache_flush(aot_text, (uint32)total_size);
 #else
                     bh_memcpy_s(aot_text, (uint32)total_size,
                                 section->section_body, (uint32)section_size);
@@ -4379,8 +4384,10 @@ create_sections(AOTModule *module, const uint8 *buf, uint32 size,
                     destroy_aot_text = true;
 
                     if ((uint32)total_size > section->section_body_size) {
+#if (WASM_MEM_DUAL_BUS_MIRROR == 0)
                         memset(aot_text + (uint32)section_size, 0,
                                (uint32)total_size - section_size);
+#endif
                         section->section_body_size = (uint32)total_size;
                     }
                 }

@@ -46,6 +46,23 @@ typedef unsigned int korp_sem;
 
 #define BH_APPLET_PRESERVED_STACK_SIZE (2 * BH_KB)
 
+/* Executable mappings (AOT text) come from PSRAM: the ESP32-S3 fetches them
+ * through the instruction-bus alias of its data mapping, and the ESP32-P4's
+ * external RAM carries no PMP entry. See espidf_memmap.c. */
+#if CONFIG_SPIRAM \
+    && ((WASM_MEM_DUAL_BUS_MIRROR != 0) || CONFIG_IDF_TARGET_ESP32P4)
+#define WASM_ESPIDF_EXEC_IN_PSRAM 1
+#else
+#define WASM_ESPIDF_EXEC_IN_PSRAM 0
+#endif
+
+/* Data allocations of this many bytes or more are PSRAM only on a board with
+ * PSRAM, and fail rather than fall back to internal SRAM (espidf_memmap.c,
+ * espidf_malloc.c). */
+#ifndef WASM_ESPIDF_PSRAM_THRESHOLD
+#define WASM_ESPIDF_PSRAM_THRESHOLD 1024
+#endif
+
 /* Default thread priority */
 #define BH_THREAD_DEFAULT_PRIORITY 5
 
