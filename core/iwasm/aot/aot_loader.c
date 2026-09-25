@@ -2734,7 +2734,13 @@ load_text_section(const uint8 *buf, const uint8 *buf_end, AOTModule *module,
 
     /* literal data is at beginning of the text section */
     module->literal = (uint8 *)buf;
+#if (WASM_MEM_DUAL_BUS_MIRROR != 0)
+    /* Moybyte #158: fetch through the instruction alias (flash XIP window or
+     * PSRAM mirror); the buffer itself stays the readable one. */
+    module->code = os_get_ibus_mirror((void *)(buf + module->literal_size));
+#else
     module->code = (void *)(buf + module->literal_size);
+#endif
     module->code_size = (uint32)(buf_end - (uint8 *)module->code);
 
 #if WASM_ENABLE_DEBUG_AOT != 0

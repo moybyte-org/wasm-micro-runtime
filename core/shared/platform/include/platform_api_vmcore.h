@@ -168,6 +168,11 @@ os_mremap(void *old_addr, size_t old_size, size_t new_size);
 #if (WASM_MEM_DUAL_BUS_MIRROR != 0)
 void *
 os_get_dbus_mirror(void *ibus);
+/* Moybyte #158 */
+void *
+os_get_ibus_mirror(void *dbus);
+void
+os_register_xip_window(const void *ibus, const void *dbus, size_t size);
 #endif
 
 /**

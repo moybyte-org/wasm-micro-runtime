@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
  */
 
+#include <stdio.h>
 #include "aot_reloc.h"
 
 #define R_XTENSA_32 1        /* Direct 32 bit */
@@ -143,8 +144,11 @@ check_reloc_offset(uint32 target_section_size, uint64 reloc_offset,
 {
     if (!(reloc_offset < (uint64)target_section_size
           && reloc_offset + reloc_data_size <= (uint64)target_section_size)) {
-        set_error_buf(error_buf, error_buf_size,
-                      "AOT module load failed: invalid relocation offset.");
+        if (error_buf) /* Moybyte #158 */
+            snprintf(error_buf, error_buf_size,
+                     "AOT module load failed: invalid relocation offset "
+                     "%u+%u > section %u.", (unsigned)reloc_offset,
+                     (unsigned)reloc_data_size, (unsigned)target_section_size);
         return false;
     }
     return true;
