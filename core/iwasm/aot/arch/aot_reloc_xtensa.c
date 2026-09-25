@@ -51,7 +51,8 @@ void __floatdisf(void);
 void __floatundisf(void);
 
 
-static SymbolMap target_sym_map[] = {
+/* const: read only, so it stays in flash instead of internal RAM */
+static const SymbolMap target_sym_map[] = {
     REG_COMMON_SYMBOLS
 
     /* API's for soft-float */
@@ -110,7 +111,7 @@ SymbolMap *
 get_target_symbol_map(uint32 *sym_num)
 {
     *sym_num = sizeof(target_sym_map) / sizeof(SymbolMap);
-    return target_sym_map;
+    return (SymbolMap *)target_sym_map;
 }
 
 void

@@ -111,7 +111,8 @@ bool __atomic_compare_exchange_4(volatile void *, void *, unsigned int,
 void __atomic_store_4(volatile void *, unsigned int, int);
 /* clang-format on */
 
-static SymbolMap target_sym_map[] = {
+/* const: read only, so it stays in flash instead of internal RAM */
+static const SymbolMap target_sym_map[] = {
     /* clang-format off */
     REG_COMMON_SYMBOLS
 #ifdef NEED_SOFT_FP
@@ -220,7 +221,7 @@ SymbolMap *
 get_target_symbol_map(uint32 *sym_num)
 {
     *sym_num = sizeof(target_sym_map) / sizeof(SymbolMap);
-    return target_sym_map;
+    return (SymbolMap *)target_sym_map;
 }
 
 /* Get a val from given address */
