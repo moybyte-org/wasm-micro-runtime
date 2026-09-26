@@ -198,6 +198,32 @@ aot_target_precheck_can_use_musttail(const AOTCompContext *comp_ctx)
     return true;
 }
 
+/*
+ * return if the target's scalar loads and stores accept a misaligned
+ * address in hardware, so an access to linear memory need not be split into
+ * bytes when the compiler cannot prove its alignment
+ */
+bool
+aot_target_has_misaligned_access(const AOTCompContext *comp_ctx)
+{
+    if (!strcmp(comp_ctx->target_arch, "xtensa")) {
+        /*
+         * The ESP32-S3's LX7 handles misaligned loads and stores in
+         * hardware (XCHAL_UNALIGNED_LOAD_HW and XCHAL_UNALIGNED_STORE_HW
+         * in its core-isa.h), and Espressif's Xtensa backend does not know
+         * it: given alignment 1 it emits four byte loads, shifts and ors
+         * for every i32 load.
+         */
+        return comp_ctx->target_cpu
+               && !strcmp(comp_ctx->target_cpu, "esp32s3");
+    }
+    /*
+     * others: alignment 1. Where the backend has a feature for misaligned
+     * access (RISC-V's +unaligned-scalar-mem), --cpu-features says so.
+     */
+    return false;
+}
+
 unsigned int
 aot_estimate_stack_usage_for_function_call(const AOTCompContext *comp_ctx,
                                            const AOTFuncType *callee_func_type)

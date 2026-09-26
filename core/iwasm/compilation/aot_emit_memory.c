@@ -709,7 +709,13 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         }
     }
     else if (alignp != NULL) {
-        *alignp = 1;
+        /* An address the compiler cannot see may be misaligned. A target
+           whose loads and stores handle that in hardware takes the access
+           at its own width; any other is given alignment 1, which LLVM
+           splits into byte accesses where the target needs it. */
+        *alignp = (bytes <= 8 && aot_target_has_misaligned_access(comp_ctx))
+                      ? bytes
+                      : 1;
     }
 
     /* The overflow check needs to be done under following conditions:
