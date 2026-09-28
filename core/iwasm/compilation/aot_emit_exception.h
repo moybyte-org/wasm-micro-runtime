@@ -17,6 +17,14 @@ aot_emit_exception(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                    int32 exception_id, bool is_cond_br, LLVMValueRef cond_br_if,
                    LLVMBasicBlockRef cond_br_else_block);
 
+/* aot_emit_exception with the exception id an i32 value computed at run
+   time rather than a constant. */
+bool
+aot_emit_exception_value(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
+                         LLVMValueRef exce_id, bool is_cond_br,
+                         LLVMValueRef cond_br_if,
+                         LLVMBasicBlockRef cond_br_else_block);
+
 #ifdef __cplusplus
 } /* end of extern "C" */
 #endif

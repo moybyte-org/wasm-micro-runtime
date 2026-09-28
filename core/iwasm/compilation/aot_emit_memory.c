@@ -718,6 +718,70 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                       : 1;
     }
 
+    /* On a 32-bit target, a 32-bit memory whose initial size holds
+     * offset + bytes -- a memory never shrinks below it -- takes one unsigned
+     * compare for both the wrap of addr + offset and the bound:
+     *     addr <= (size - 1) - (offset + bytes - 1)
+     * The limit is never negative, and a wrapped addr + offset only arises
+     * from an addr above it. Indirect mode keeps the general form: its
+     * constants come from a table. */
+    if (!is_target_64bit && !is_memory64 && !enable_segue
+        && comp_ctx->enable_bound_check && !comp_ctx->is_indirect_mode
+#if WASM_ENABLE_SHARED_HEAP != 0
+        && !comp_ctx->enable_shared_heap && !comp_ctx->enable_shared_chain
+#endif
+        && comp_ctx->comp_data->memories[0].init_page_count > 0
+        && (uint64)offset + bytes
+               <= (uint64)comp_ctx->comp_data->memories[0].num_bytes_per_page
+                      * comp_ctx->comp_data->memories[0].init_page_count) {
+        if (!(is_local_of_aot_value
+              && aot_checked_addr_list_find(func_ctx, local_idx_of_aot_value,
+                                            offset, bytes))) {
+            LLVMValueRef limit;
+
+            if (!(mem_check_bound =
+                      get_memory_check_bound(comp_ctx, func_ctx, 1))) {
+                goto fail;
+            }
+            if (!(limit = LLVMBuildNUWSub(
+                      comp_ctx->builder, mem_check_bound,
+                      I32_CONST((uint32)(offset + bytes - 1)), "limit"))) {
+                aot_set_last_error("llvm build sub failed.");
+                goto fail;
+            }
+            BUILD_ICMP(LLVMIntUGT, addr, limit, cmp, "cmp");
+
+            ADD_BASIC_BLOCK(check_succ, "check_succ");
+            LLVMMoveBasicBlockAfter(check_succ, block_curr);
+
+            if (!aot_emit_exception(comp_ctx, func_ctx,
+                                    EXCE_OUT_OF_BOUNDS_MEMORY_ACCESS, true, cmp,
+                                    check_succ)) {
+                goto fail;
+            }
+            SET_BUILD_POS(check_succ);
+
+            if (is_local_of_aot_value) {
+                if (!aot_checked_addr_list_add(func_ctx, local_idx_of_aot_value,
+                                               offset, bytes))
+                    goto fail;
+            }
+        }
+
+        if (!(offset1 = LLVMBuildNUWAdd(comp_ctx->builder, addr, offset_const,
+                                        "offset1"))) {
+            aot_set_last_error("llvm build add failed.");
+            goto fail;
+        }
+        if (!(maddr = LLVMBuildInBoundsGEP2(comp_ctx->builder, INT8_TYPE,
+                                            mem_base_addr, &offset1, 1,
+                                            "maddr"))) {
+            aot_set_last_error("llvm build add failed.");
+            goto fail;
+        }
+        return maddr;
+    }
+
     /* The overflow check needs to be done under following conditions:
      * 1. In 64-bit target, offset and addr will be extended to 64-bit
      *    1.1 offset + addr can overflow when it's memory64

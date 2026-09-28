@@ -45,68 +45,62 @@ trunc_float_to_int(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                    LLVMTypeRef dest_type, LLVMValueRef min_value,
                    LLVMValueRef max_value, char *name, bool sign)
 {
-    LLVMBasicBlockRef check_nan_succ, check_overflow_succ;
-    LLVMValueRef is_less, is_greater, res;
+    LLVMBasicBlockRef check_succ, conv_trap;
+    LLVMValueRef above_min, below_max, in_range, is_nan, exce_id, cond_br, res;
 
-    res = call_fcmp_intrinsic(comp_ctx, func_ctx, FLOAT_UNO, LLVMRealUNO,
-                              operand, operand, src_type, "fcmp_is_nan");
-
-    if (!res) {
+    /* One branch covers NaN and both ends of the range: an ordered compare
+       is false for a NaN. Which trap it was is decided on the trap path. */
+    if (!(above_min = call_fcmp_intrinsic(comp_ctx, func_ctx, FLOAT_GT,
+                                          LLVMRealOGT, operand, min_value,
+                                          src_type, "fcmp_above_min"))
+        || !(below_max = call_fcmp_intrinsic(comp_ctx, func_ctx, FLOAT_LT,
+                                             LLVMRealOLT, operand, max_value,
+                                             src_type, "fcmp_below_max"))) {
         aot_set_last_error("llvm build fcmp failed.");
         goto fail;
     }
+    if (!(in_range =
+              LLVMBuildAnd(comp_ctx->builder, above_min, below_max, "in_range"))) {
+        aot_set_last_error("llvm build and failed.");
+        goto fail;
+    }
 
-    if (!(check_nan_succ = LLVMAppendBasicBlockInContext(
-              comp_ctx->context, func_ctx->func, "check_nan_succ"))) {
+    if (!(conv_trap = LLVMAppendBasicBlockInContext(
+              comp_ctx->context, func_ctx->func, "conv_trap"))
+        || !(check_succ = LLVMAppendBasicBlockInContext(
+                 comp_ctx->context, func_ctx->func, "check_conv_succ"))) {
         aot_set_last_error("llvm add basic block failed.");
         goto fail;
     }
+    LLVMMoveBasicBlockAfter(check_succ, LLVMGetInsertBlock(comp_ctx->builder));
+    LLVMMoveBasicBlockAfter(conv_trap, check_succ);
 
-    LLVMMoveBasicBlockAfter(check_nan_succ,
-                            LLVMGetInsertBlock(comp_ctx->builder));
-
-    if (!(aot_emit_exception(comp_ctx, func_ctx,
-                             EXCE_INVALID_CONVERSION_TO_INTEGER, true, res,
-                             check_nan_succ)))
+    if (!(cond_br = LLVMBuildCondBr(comp_ctx->builder, in_range, check_succ,
+                                    conv_trap))) {
+        aot_set_last_error("llvm build cond br failed.");
         goto fail;
+    }
+    aot_set_cond_br_weights(comp_ctx, cond_br, 2000, 1);
 
-    is_less =
-        call_fcmp_intrinsic(comp_ctx, func_ctx, FLOAT_LE, LLVMRealOLE, operand,
-                            min_value, src_type, "fcmp_min_value");
-
-    if (!is_less) {
+    LLVMPositionBuilderAtEnd(comp_ctx->builder, conv_trap);
+    if (!(is_nan = call_fcmp_intrinsic(comp_ctx, func_ctx, FLOAT_UNO,
+                                       LLVMRealUNO, operand, operand, src_type,
+                                       "fcmp_is_nan"))) {
         aot_set_last_error("llvm build fcmp failed.");
         goto fail;
     }
-
-    is_greater =
-        call_fcmp_intrinsic(comp_ctx, func_ctx, FLOAT_GE, LLVMRealOGE, operand,
-                            max_value, src_type, "fcmp_min_value");
-
-    if (!is_greater) {
-        aot_set_last_error("llvm build fcmp failed.");
+    if (!(exce_id = LLVMBuildSelect(
+              comp_ctx->builder, is_nan,
+              I32_CONST(EXCE_INVALID_CONVERSION_TO_INTEGER),
+              I32_CONST(EXCE_INTEGER_OVERFLOW), "exce_id"))) {
+        aot_set_last_error("llvm build select failed.");
         goto fail;
     }
-
-    if (!(res = LLVMBuildOr(comp_ctx->builder, is_less, is_greater,
-                            "is_overflow"))) {
-        aot_set_last_error("llvm build logic and failed.");
+    if (!aot_emit_exception_value(comp_ctx, func_ctx, exce_id, false, NULL,
+                                  NULL))
         goto fail;
-    }
 
-    /* Check if float value out of range */
-    if (!(check_overflow_succ = LLVMAppendBasicBlockInContext(
-              comp_ctx->context, func_ctx->func, "check_overflow_succ"))) {
-        aot_set_last_error("llvm add basic block failed.");
-        goto fail;
-    }
-
-    LLVMMoveBasicBlockAfter(check_overflow_succ,
-                            LLVMGetInsertBlock(comp_ctx->builder));
-
-    if (!(aot_emit_exception(comp_ctx, func_ctx, EXCE_INTEGER_OVERFLOW, true,
-                             res, check_overflow_succ)))
-        goto fail;
+    LLVMPositionBuilderAtEnd(comp_ctx->builder, check_succ);
 
     if (comp_ctx->disable_llvm_intrinsics
         && aot_intrinsic_check_capability(comp_ctx, name)) {
@@ -158,6 +152,30 @@ trunc_sat_float_to_int(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     LLVMValueRef is_less, is_greater, res, phi;
     LLVMValueRef zero = (dest_type == I32_TYPE) ? I32_ZERO : I64_ZERO;
     LLVMValueRef vmin, vmax;
+
+    if (!comp_ctx->disable_llvm_intrinsics
+        && strcmp(comp_ctx->target_arch, "xtensa")) {
+        /* wasm's saturating truncation is LLVM's fpto[su]i.sat: a NaN gives
+           0 and a value past either end of the range gives that end. A
+           target whose conversion saturates takes it in a few instructions;
+           Xtensa's backend expands it into branches no cheaper than these. */
+        char sat[48];
+        LLVMTypeRef sat_param_types[1] = { src_type };
+
+        snprintf(sat, sizeof(sat), "llvm.fpto%ci.sat.i%u.f%u", sign ? 's' : 'u',
+                 LLVMGetIntTypeWidth(dest_type),
+                 LLVMGetTypeKind(src_type) == LLVMFloatTypeKind ? 32 : 64);
+        if (!(res = aot_call_llvm_intrinsic(comp_ctx, func_ctx, sat, dest_type,
+                                            sat_param_types, 1, operand))) {
+            aot_set_last_error("llvm build saturating conversion failed.");
+            goto fail;
+        }
+        if (dest_type == I32_TYPE)
+            PUSH_I32(res);
+        else
+            PUSH_I64(res);
+        return true;
+    }
 
     if (!(res =
               call_fcmp_intrinsic(comp_ctx, func_ctx, FLOAT_UNO, LLVMRealUNO,

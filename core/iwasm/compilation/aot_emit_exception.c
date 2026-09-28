@@ -13,15 +13,34 @@ aot_emit_exception(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                    int32 exception_id, bool is_cond_br, LLVMValueRef cond_br_if,
                    LLVMBasicBlockRef cond_br_else_block)
 {
-    LLVMBasicBlockRef block_curr = LLVMGetInsertBlock(comp_ctx->builder);
-    LLVMValueRef exce_id = I32_CONST((uint32)exception_id), func_const, func;
-    LLVMTypeRef param_types[2], ret_type, func_type, func_ptr_type;
-    LLVMValueRef param_values[2];
-    bool is_64bit = (comp_ctx->pointer_size == sizeof(uint64)) ? true : false;
+    LLVMValueRef exce_id = I32_CONST((uint32)exception_id);
 
     bh_assert(exception_id >= 0 && exception_id < EXCE_NUM);
 
     CHECK_LLVM_CONST(exce_id);
+    return aot_emit_exception_value(comp_ctx, func_ctx, exce_id, is_cond_br,
+                                    cond_br_if, cond_br_else_block);
+fail:
+    return false;
+}
+
+/* The exception path is cold: every branch into it is weighted so, and the
+   call that raises the exception is marked cold, so block placement and the
+   register allocator keep its copies and reloads off the path that runs. */
+#define EXCE_BRANCH_WEIGHT_TAKEN 1
+#define EXCE_BRANCH_WEIGHT_NOT_TAKEN 2000
+
+bool
+aot_emit_exception_value(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
+                         LLVMValueRef exce_id, bool is_cond_br,
+                         LLVMValueRef cond_br_if,
+                         LLVMBasicBlockRef cond_br_else_block)
+{
+    LLVMBasicBlockRef block_curr = LLVMGetInsertBlock(comp_ctx->builder);
+    LLVMValueRef func_const, func, call, cond_br;
+    LLVMTypeRef param_types[2], ret_type, func_type, func_ptr_type;
+    LLVMValueRef param_values[2];
+    bool is_64bit = (comp_ctx->pointer_size == sizeof(uint64)) ? true : false;
 
     /* Create got_exception block if needed */
     if (!func_ctx->got_exception_block) {
@@ -115,11 +134,16 @@ aot_emit_exception(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         /* Call the aot_set_exception_with_id() function */
         param_values[0] = func_ctx->aot_inst;
         param_values[1] = func_ctx->exception_id_phi;
-        if (!LLVMBuildCall2(comp_ctx->builder, func_type, func, param_values, 2,
-                            "")) {
+        if (!(call = LLVMBuildCall2(comp_ctx->builder, func_type, func,
+                                    param_values, 2, ""))) {
             aot_set_last_error("llvm build call failed.");
             return false;
         }
+        LLVMAddCallSiteAttribute(
+            call, LLVMAttributeFunctionIndex,
+            LLVMCreateEnumAttribute(
+                comp_ctx->context,
+                LLVMGetEnumAttributeKindForName("cold", strlen("cold")), 0));
 
         /* Create return IR */
         AOTFuncType *aot_func_type = func_ctx->aot_func->func_type;
@@ -172,17 +196,17 @@ aot_emit_exception(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     }
     else {
         /* Create condition br */
-        if (!LLVMBuildCondBr(comp_ctx->builder, cond_br_if,
-                             func_ctx->got_exception_block,
-                             cond_br_else_block)) {
+        if (!(cond_br = LLVMBuildCondBr(comp_ctx->builder, cond_br_if,
+                                        func_ctx->got_exception_block,
+                                        cond_br_else_block))) {
             aot_set_last_error("llvm build cond br failed.");
             return false;
         }
+        aot_set_cond_br_weights(comp_ctx, cond_br, EXCE_BRANCH_WEIGHT_TAKEN,
+                                EXCE_BRANCH_WEIGHT_NOT_TAKEN);
         /* Start to translate the else block */
         LLVMPositionBuilderAtEnd(comp_ctx->builder, cond_br_else_block);
     }
 
     return true;
-fail:
-    return false;
 }
