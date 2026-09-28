@@ -131,7 +131,7 @@ os_mem_decommit(void *addr, size_t size)
 int
 os_mprotect(void *addr, size_t size, int prot)
 {
-    DWORD protect;
+    DWORD protect, old_protect;
     size_t page_size = os_getpagesize();
     size_t request_size = (size + page_size - 1) & ~(page_size - 1);
 
@@ -143,5 +143,9 @@ os_mprotect(void *addr, size_t size, int prot)
     printf("Mprotect memory, addr: %p, request_size: %zu, protect: 0x%x\n",
            addr, request_size, protect);
 #endif
-    return VirtualProtect((LPVOID)addr, request_size, protect, NULL);
+    /* VirtualProtect fails without somewhere to write the old protection,
+       and returns nonzero on success where callers expect 0. */
+    return VirtualProtect((LPVOID)addr, request_size, protect, &old_protect)
+               ? 0
+               : -1;
 }
