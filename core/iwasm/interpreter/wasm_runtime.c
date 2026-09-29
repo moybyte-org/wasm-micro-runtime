@@ -240,7 +240,7 @@ memories_deinstantiate(WASMModuleInstance *module_inst,
     uint32 i;
     if (memories) {
         for (i = 0; i < count; i++) {
-            if (memories[i]) {
+            if (memories[i] && !module_inst->e->memory_borrowed) {
 #if WASM_ENABLE_MULTI_MODULE != 0
                 WASMModule *module = module_inst->module;
                 if (i < module->import_memory_count
@@ -279,6 +279,19 @@ memory_instantiate(WASMModuleInstance *module_inst, WASMModuleInstance *parent,
                    uint32 max_page_count, uint32 heap_size, uint32 flags,
                    char *error_buf, uint32 error_buf_size)
 {
+    /* A sibling (wasm_instantiate_sibling) runs over its parent's memory
+       itself: one that cannot grow never moves or changes size, and the
+       parent alone frees it. */
+    if (module_inst->e->memory_borrowed) {
+        WASMMemoryInstance *theirs = parent->memories[memory_idx];
+        if (theirs->cur_page_count != theirs->max_page_count) {
+            set_error_buf(error_buf, error_buf_size,
+                          "a sibling instance needs a memory that cannot grow");
+            return NULL;
+        }
+        return theirs;
+    }
+
     WASMModule *module = module_inst->module;
     uint32 inc_page_count, global_idx, default_max_page;
     uint32 bytes_of_last_page, bytes_to_page_end;
@@ -2419,11 +2432,11 @@ wasm_set_running_mode(WASMModuleInstance *module_inst, RunningMode running_mode)
 /**
  * Instantiate module
  */
-WASMModuleInstance *
-wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
-                 WASMExecEnv *exec_env_main, uint32 stack_size,
-                 uint32 heap_size, uint32 max_memory_pages, char *error_buf,
-                 uint32 error_buf_size)
+static WASMModuleInstance *
+instantiate(WASMModule *module, WASMModuleInstance *parent,
+            WASMExecEnv *exec_env_main, uint32 stack_size, uint32 heap_size,
+            uint32 max_memory_pages, bool borrow, char *error_buf,
+            uint32 error_buf_size)
 {
     WASMModuleInstance *module_inst;
     WASMGlobalInstance *globals = NULL, *global;
@@ -2509,6 +2522,7 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
     module_inst->module = module;
     module_inst->e =
         (WASMModuleInstanceExtra *)((uint8 *)module_inst + extra_info_offset);
+    module_inst->e->memory_borrowed = borrow;
 
 #if WASM_ENABLE_MULTI_MODULE != 0
     module_inst->e->sub_module_inst_list =
@@ -3319,8 +3333,11 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
                 &module_inst->e->functions[module->start_function];
     }
 
-    if (!execute_post_instantiate_functions(module_inst, is_sub_inst,
-                                            exec_env_main)) {
+    /* A sibling runs nothing at instantiation: the start function and the
+       constructors belong to the memory, which its parent already set up. */
+    if (!borrow
+        && !execute_post_instantiate_functions(module_inst, is_sub_inst,
+                                               exec_env_main)) {
         set_error_buf(error_buf, error_buf_size, module_inst->cur_exception);
         goto fail;
     }
@@ -3360,6 +3377,24 @@ destroy_c_api_frames(Vector *frames)
     (void)ret;
 }
 #endif
+
+WASMModuleInstance *
+wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
+                 WASMExecEnv *exec_env_main, uint32 stack_size,
+                 uint32 heap_size, uint32 max_memory_pages, char *error_buf,
+                 uint32 error_buf_size)
+{
+    return instantiate(module, parent, exec_env_main, stack_size, heap_size,
+                       max_memory_pages, false, error_buf, error_buf_size);
+}
+
+WASMModuleInstance *
+wasm_instantiate_sibling(WASMModuleInstance *parent, uint32 stack_size,
+                         char *error_buf, uint32 error_buf_size)
+{
+    return instantiate(parent->module, parent, NULL, stack_size, 0, 0, true,
+                       error_buf, error_buf_size);
+}
 
 void
 wasm_deinstantiate(WASMModuleInstance *module_inst, bool is_sub_inst)
