@@ -1826,7 +1826,10 @@ aot_create_stack_sizes(const AOTCompData *comp_data, AOTCompContext *comp_ctx)
     uint64 size;
     uint32 i;
 
-    stack_sizes_type = LLVMArrayType(I32_TYPE, comp_data->func_count);
+    uint32 count =
+        comp_data->func_count * (comp_ctx->call_internal_directly ? 2 : 1);
+
+    stack_sizes_type = LLVMArrayType(I32_TYPE, count);
     if (!stack_sizes_type) {
         aot_set_last_error("failed to create stack_sizes type.");
         return false;
@@ -1839,13 +1842,13 @@ aot_create_stack_sizes(const AOTCompData *comp_data, AOTCompContext *comp_ctx)
         return false;
     }
 
-    size = sizeof(LLVMValueRef) * comp_data->func_count;
+    size = sizeof(LLVMValueRef) * count;
     if (size >= UINT32_MAX || !(values = wasm_runtime_malloc((uint32)size))) {
         aot_set_last_error("allocate memory failed.");
         return false;
     }
 
-    for (i = 0; i < comp_data->func_count; i++) {
+    for (i = 0; i < count; i++) {
         /*
          * This value is a placeholder, which will be replaced
          * after the corresponding functions are compiled.
@@ -1856,7 +1859,7 @@ aot_create_stack_sizes(const AOTCompData *comp_data, AOTCompContext *comp_ctx)
         values[i] = I32_NEG_ONE;
     }
 
-    array = LLVMConstArray(I32_TYPE, values, comp_data->func_count);
+    array = LLVMConstArray(I32_TYPE, values, count);
     wasm_runtime_free(values);
     if (!array) {
         aot_set_last_error("failed to create stack_sizes initializer.");
@@ -1900,6 +1903,162 @@ aot_create_stack_sizes(const AOTCompData *comp_data, AOTCompContext *comp_ctx)
     }
     comp_ctx->stack_sizes_type = stack_sizes_type;
     comp_ctx->stack_sizes = stack_sizes;
+    return true;
+}
+
+/* native_stack_avail: the stack pointer minus the native stack bound, as a
+   signed integer, which a function's entry compares with the largest frame
+   it calls directly (a negative value, a frame already past the bound,
+   traps whatever that frame needs). */
+static bool
+create_native_stack_avail(const AOTCompContext *comp_ctx,
+                          AOTFuncContext *func_ctx)
+{
+    LLVMTypeRef intptr_type = comp_ctx->pointer_size == sizeof(uint64)
+                                  ? I64_TYPE
+                                  : I32_TYPE;
+    LLVMTypeRef save_type;
+    LLVMValueRef save_func, sp, sp_int, bound_int;
+    const char *name = "llvm.stacksave.p0";
+
+    if (!create_native_stack_bound(comp_ctx, func_ctx))
+        return false;
+
+    if (!(save_type = LLVMFunctionType(OPQ_PTR_TYPE, NULL, 0, false))) {
+        aot_set_last_error("create LLVM function type failed.");
+        return false;
+    }
+    if (!(save_func = LLVMGetNamedFunction(func_ctx->module, name))
+        && !(save_func = LLVMAddFunction(func_ctx->module, name, save_type))) {
+        aot_set_last_error("add LLVM function failed.");
+        return false;
+    }
+    if (!(sp = LLVMBuildCall2(comp_ctx->builder, save_type, save_func, NULL, 0,
+                              "sp"))
+        || !(sp_int = LLVMBuildPtrToInt(comp_ctx->builder, sp, intptr_type,
+                                        "sp_int"))
+        || !(bound_int = LLVMBuildPtrToInt(comp_ctx->builder,
+                                           func_ctx->native_stack_bound,
+                                           intptr_type, "bound_int"))
+        || !(func_ctx->native_stack_avail = LLVMBuildSub(
+                 comp_ctx->builder, sp_int, bound_int, "native_stack_avail"))) {
+        aot_set_last_error("llvm build native stack avail failed.");
+        return false;
+    }
+    return true;
+}
+
+/* What a direct call to function `index` calls: its body. On Xtensa the
+   body is a short call from its precheck wrapper beside it, and an alias of
+   it, which carries no such attribute, is what the other functions call, a
+   long call that reaches anywhere in the text. */
+LLVMValueRef
+aot_direct_call_target(AOTCompContext *comp_ctx, uint32 index)
+{
+    AOTFuncContext *callee = comp_ctx->func_ctxes[index];
+    char name[48];
+
+    if (strcmp(comp_ctx->target_arch, "xtensa"))
+        return callee->func;
+    if (callee->direct_call_alias)
+        return callee->direct_call_alias;
+    snprintf(name, sizeof(name), "%s%u_long", AOT_FUNC_INTERNAL_PREFIX, index);
+    if (!(callee->direct_call_alias = LLVMAddAlias2(
+              comp_ctx->module, callee->func_type, 0, callee->func, name))) {
+        aot_set_last_error("add LLVM alias failed.");
+        return NULL;
+    }
+    LLVMSetLinkage(callee->direct_call_alias, LLVMInternalLinkage);
+    return callee->direct_call_alias;
+}
+
+bool
+aot_record_direct_callee(AOTFuncContext *func_ctx, uint32 index)
+{
+    uint32 i;
+
+    for (i = 0; i < func_ctx->direct_callee_count; i++)
+        if (func_ctx->direct_callees[i] == index)
+            return true;
+    if (func_ctx->direct_callee_count == func_ctx->direct_callee_capacity) {
+        uint32 capacity = func_ctx->direct_callee_capacity
+                              ? func_ctx->direct_callee_capacity * 2
+                              : 8;
+        uint32 *callees = wasm_runtime_malloc(sizeof(uint32) * capacity);
+        if (!callees) {
+            aot_set_last_error("allocate memory failed.");
+            return false;
+        }
+        if (func_ctx->direct_callees) {
+            bh_memcpy_s(callees, sizeof(uint32) * capacity,
+                        func_ctx->direct_callees,
+                        sizeof(uint32) * func_ctx->direct_callee_count);
+            wasm_runtime_free(func_ctx->direct_callees);
+        }
+        func_ctx->direct_callees = callees;
+        func_ctx->direct_callee_capacity = capacity;
+    }
+    func_ctx->direct_callees[func_ctx->direct_callee_count++] = index;
+    return true;
+}
+
+/* At the entry of a function that calls others directly: trap unless the
+   native stack below its frame holds the largest frame it calls directly,
+   stack_sizes[func_count + func_index], filled in when the frames are
+   known. A callee's own entry checks for its callees in turn; a frame
+   reached any other way (an export, call_indirect) is checked by its
+   precheck wrapper. Wasm leaves the depth at which a stack is exhausted to
+   the host, so a function may trap at its entry for a call it would not
+   have made. */
+bool
+aot_check_native_stack_for_callees(AOTCompContext *comp_ctx,
+                                   AOTFuncContext *func_ctx, uint32 func_index)
+{
+    LLVMTypeRef intptr_type = comp_ctx->pointer_size == sizeof(uint64)
+                                  ? I64_TYPE
+                                  : I32_TYPE;
+    LLVMValueRef idx, needp, need, cmp;
+    LLVMBasicBlockRef check_succ;
+    AOTBlock *func_block = func_ctx->block_stack.block_list_head;
+
+    if (!(idx = I32_CONST(comp_ctx->func_ctx_count + func_index))
+        || !(needp = LLVMBuildInBoundsGEP2(comp_ctx->builder, I32_TYPE,
+                                           comp_ctx->stack_sizes, &idx, 1,
+                                           "callee_stack_need_p"))
+        || !(need = LLVMBuildLoad2(comp_ctx->builder, I32_TYPE, needp,
+                                   "callee_stack_need"))) {
+        aot_set_last_error("llvm build load failed.");
+        return false;
+    }
+    LLVMSetMetadata(need,
+                    LLVMGetMDKindIDInContext(comp_ctx->context,
+                                             "invariant.load",
+                                             (unsigned)strlen("invariant.load")),
+                    LLVMMDNodeInContext(comp_ctx->context, NULL, 0));
+    if (intptr_type != I32_TYPE
+        && !(need = LLVMBuildZExt(comp_ctx->builder, need, intptr_type,
+                                  "callee_stack_need_ext"))) {
+        aot_set_last_error("llvm build zext failed.");
+        return false;
+    }
+    if (!(cmp = LLVMBuildICmp(comp_ctx->builder, LLVMIntSLT,
+                              func_ctx->native_stack_avail, need,
+                              "native_stack_short"))) {
+        aot_set_last_error("llvm build icmp failed.");
+        return false;
+    }
+    if (!(check_succ = LLVMAppendBasicBlockInContext(
+              comp_ctx->context, func_ctx->func, "check_native_stack_succ"))) {
+        aot_set_last_error("llvm add basic block failed.");
+        return false;
+    }
+    LLVMMoveBasicBlockAfter(check_succ, LLVMGetInsertBlock(comp_ctx->builder));
+    if (!aot_emit_exception(comp_ctx, func_ctx, EXCE_NATIVE_STACK_OVERFLOW,
+                            true, cmp, check_succ))
+        return false;
+    LLVMPositionBuilderAtEnd(comp_ctx->builder, check_succ);
+    /* The body continues from here */
+    func_block->llvm_entry_block = check_succ;
     return true;
 }
 
@@ -1961,6 +2120,11 @@ aot_create_func_context(const AOTCompData *comp_data, AOTCompContext *comp_ctx,
 
     /* Get argv buffer address */
     if (wasm_func->has_op_func_call && !create_argv_buf(comp_ctx, func_ctx)) {
+        goto fail;
+    }
+
+    if (comp_ctx->call_internal_directly && wasm_func->has_op_func_call
+        && !create_native_stack_avail(comp_ctx, func_ctx)) {
         goto fail;
     }
 
@@ -2035,6 +2199,8 @@ aot_destroy_func_contexts(AOTCompContext *comp_ctx, AOTFuncContext **func_ctxes,
                 wasm_runtime_free(func_ctxes[i]->mem_info);
             aot_block_stack_destroy(comp_ctx, &func_ctxes[i]->block_stack);
             aot_checked_addr_list_destroy(func_ctxes[i]);
+            if (func_ctxes[i]->direct_callees)
+                wasm_runtime_free(func_ctxes[i]->direct_callees);
             wasm_runtime_free(func_ctxes[i]);
         }
     wasm_runtime_free(func_ctxes);
@@ -3220,6 +3386,11 @@ aot_create_comp_context(const AOTCompData *comp_data, aot_comp_option_t option)
              * value as the bound check */
             comp_ctx->enable_stack_bound_check = comp_ctx->enable_bound_check;
         }
+
+        comp_ctx->call_internal_directly =
+            comp_ctx->enable_stack_bound_check
+            && !comp_ctx->enable_stack_estimation && !comp_ctx->is_jit_mode
+            && !comp_ctx->is_indirect_mode;
 
         if ((comp_ctx->enable_stack_bound_check
              || comp_ctx->enable_stack_estimation)

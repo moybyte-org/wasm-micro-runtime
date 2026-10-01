@@ -1739,6 +1739,15 @@ aot_compile_op_call(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                 goto fail;
             }
         }
+        else if (comp_ctx->call_internal_directly
+                 && func_ctx->native_stack_avail) {
+            if (!aot_record_direct_callee(func_ctx,
+                                          func_idx - import_func_count))
+                goto fail;
+            if (!(func = aot_direct_call_target(comp_ctx,
+                                                func_idx - import_func_count)))
+                goto fail;
+        }
         else {
             if (func_ctxes[func_idx - import_func_count] == func_ctx) {
                 /* recursive call */

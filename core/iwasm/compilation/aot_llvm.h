@@ -236,6 +236,16 @@ typedef struct AOTFuncContext {
     LLVMValueRef aot_inst;
     LLVMValueRef argv_buf;
     LLVMValueRef native_stack_bound;
+    /* The native stack left below this function's frame: its stack pointer
+       minus the bound, signed */
+    LLVMValueRef native_stack_avail;
+    /* The defined functions it calls directly, by index, which its entry
+       checks the native stack for (call_internal_directly) */
+    uint32 *direct_callees;
+    uint32 direct_callee_count;
+    uint32 direct_callee_capacity;
+    /* What other functions call to reach this one's body directly */
+    LLVMValueRef direct_call_alias;
     LLVMValueRef native_stack_top_min_addr;
     LLVMValueRef aux_stack_bound;
     LLVMValueRef aux_stack_bottom;
@@ -421,6 +431,12 @@ typedef struct AOTCompContext {
 
     /* Native stack usage estimation */
     bool enable_stack_estimation;
+
+    /* A function that calls other functions directly checks at its entry
+       that the native stack holds the largest of their frames, and calls
+       their bodies, skipping their precheck wrappers. stack_sizes then has a
+       second half: for each function, the largest frame it calls directly. */
+    bool call_internal_directly;
 
     /* A memory access was checked against the fixed size of the module's
        memory, a constant: the AOT file says so (WASM_FEATURE_FIXED_MEMORY_BOUND) */
@@ -666,6 +682,17 @@ aot_target_precheck_can_use_musttail(const AOTCompContext *comp_ctx);
 
 bool
 aot_target_has_misaligned_access(const AOTCompContext *comp_ctx);
+
+LLVMValueRef
+aot_direct_call_target(AOTCompContext *comp_ctx, uint32 index);
+
+bool
+aot_record_direct_callee(AOTFuncContext *func_ctx, uint32 index);
+
+bool
+aot_check_native_stack_for_callees(AOTCompContext *comp_ctx,
+                                   AOTFuncContext *func_ctx,
+                                   uint32 func_index);
 
 uint64
 aot_fixed_memory_size(const AOTCompContext *comp_ctx);

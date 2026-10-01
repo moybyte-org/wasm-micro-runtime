@@ -1027,6 +1027,10 @@ aot_compile_func(AOTCompContext *comp_ctx, uint32 func_index)
         comp_ctx->builder,
         func_ctx->block_stack.block_list_head->llvm_entry_block);
 
+    if (func_ctx->native_stack_avail
+        && !aot_check_native_stack_for_callees(comp_ctx, func_ctx, func_index))
+        return false;
+
     if (comp_ctx->aux_stack_frame_type
         && comp_ctx->call_stack_features.frame_per_function) {
         INT_CONST(func_index_ref,

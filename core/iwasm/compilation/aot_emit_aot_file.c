@@ -2381,7 +2381,9 @@ aot_emit_object_data_section_info(uint8 *buf, uint8 *buf_end, uint32 *p_offset,
                        data_section->name)) {
             uint32 ss_offset = obj_data->stack_sizes_offset;
             uint32 ss_size =
-                obj_data->func_count * sizeof(*obj_data->stack_sizes);
+                obj_data->func_count
+                * (obj_data->comp_ctx->call_internal_directly ? 2 : 1)
+                * sizeof(*obj_data->stack_sizes);
             LOG_VERBOSE("Replacing stack_sizes in %s section, offset %" PRIu32
                         ", size %" PRIu32,
                         obj_data->stack_sizes_section_name, ss_offset, ss_size);
@@ -3640,8 +3642,9 @@ aot_resolve_stack_sizes(AOTCompContext *comp_ctx, AOTObjectData *obj_data)
              */
             const uint32 *ro_stack_sizes =
                 (const uint32 *)(LLVMGetSectionContents(sec_itr) + addr);
-            uint32 i;
-            for (i = 0; i < obj_data->func_count; i++) {
+            uint32 i, count = obj_data->func_count
+                              * (comp_ctx->call_internal_directly ? 2 : 1);
+            for (i = 0; i < count; i++) {
                 /* Note: -1 == AOT_NEG_ONE from aot_create_stack_sizes */
                 if (ro_stack_sizes[i] != (uint32)-1) {
                     aot_set_last_error("unexpected data in stack_sizes.");
@@ -3654,14 +3657,14 @@ aot_resolve_stack_sizes(AOTCompContext *comp_ctx, AOTObjectData *obj_data)
              */
             obj_data->stack_sizes_section_name = sec_name;
             obj_data->stack_sizes_offset = (uint32)addr;
-            obj_data->stack_sizes = wasm_runtime_malloc(
-                obj_data->func_count * sizeof(*obj_data->stack_sizes));
+            obj_data->stack_sizes =
+                wasm_runtime_malloc(count * sizeof(*obj_data->stack_sizes));
             if (obj_data->stack_sizes == NULL) {
                 aot_set_last_error("failed to allocate memory.");
                 goto fail;
             }
             uint32 *stack_sizes = obj_data->stack_sizes;
-            for (i = 0; i < obj_data->func_count; i++) {
+            for (i = 0; i < count; i++) {
                 stack_sizes[i] = (uint32)-1;
             }
             if (!read_stack_usage_file(comp_ctx, comp_ctx->stack_usage_file,
@@ -3726,6 +3729,19 @@ aot_resolve_stack_sizes(AOTCompContext *comp_ctx, AOTObjectData *obj_data)
                     }
                     stack_sizes[i] += stack_consumption_to_call_wrapped_func;
                 }
+            }
+            /* The largest frame each function calls directly */
+            for (i = 0; comp_ctx->call_internal_directly
+                        && i < obj_data->func_count;
+                 i++) {
+                const AOTFuncContext *func_ctx = comp_ctx->func_ctxes[i];
+                uint32 j, need = 0;
+                for (j = 0; j < func_ctx->direct_callee_count; j++) {
+                    uint32 callee = func_ctx->direct_callees[j];
+                    if (stack_sizes[callee] > need)
+                        need = stack_sizes[callee];
+                }
+                stack_sizes[obj_data->func_count + i] = need;
             }
             LLVMDisposeSectionIterator(sec_itr);
             LLVMDisposeSymbolIterator(sym_itr);
