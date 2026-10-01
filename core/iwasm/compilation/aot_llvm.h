@@ -422,6 +422,10 @@ typedef struct AOTCompContext {
     /* Native stack usage estimation */
     bool enable_stack_estimation;
 
+    /* A memory access was checked against the fixed size of the module's
+       memory, a constant: the AOT file says so (WASM_FEATURE_FIXED_MEMORY_BOUND) */
+    bool fixed_memory_bound_used;
+
     /* 128-bit SIMD */
     bool enable_simd;
 
@@ -662,6 +666,9 @@ aot_target_precheck_can_use_musttail(const AOTCompContext *comp_ctx);
 
 bool
 aot_target_has_misaligned_access(const AOTCompContext *comp_ctx);
+
+uint64
+aot_fixed_memory_size(const AOTCompContext *comp_ctx);
 
 unsigned int
 aot_estimate_stack_usage_for_function_call(const AOTCompContext *comp_ctx,

@@ -4489,6 +4489,8 @@ aot_obj_data_create(AOTCompContext *comp_ctx)
 
     /* Create wasm feature flags form compile options */
     obj_data->target_info.feature_flags = 0;
+    if (comp_ctx->fixed_memory_bound_used)
+        obj_data->target_info.feature_flags |= WASM_FEATURE_FIXED_MEMORY_BOUND;
     if (comp_ctx->enable_simd) {
         obj_data->target_info.feature_flags |= WASM_FEATURE_SIMD_128BIT;
     }

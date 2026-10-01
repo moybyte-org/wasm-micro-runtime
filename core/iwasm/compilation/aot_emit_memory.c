@@ -738,16 +738,34 @@ aot_check_memory_overflow(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
               && aot_checked_addr_list_find(func_ctx, local_idx_of_aot_value,
                                             offset, bytes))) {
             LLVMValueRef limit;
+            uint64 fixed_size = aot_fixed_memory_size(comp_ctx);
 
-            if (!(mem_check_bound =
-                      get_memory_check_bound(comp_ctx, func_ctx, 1))) {
-                goto fail;
+            /* A memory that cannot grow checks against its size, a
+               constant: no bound is held in a register across the function,
+               and the limit is rematerialized wherever it is needed. The
+               runtime refuses an instance whose memory is not that size
+               (WASM_FEATURE_FIXED_MEMORY_BOUND). On RISC-V a limit of
+               size - 1 (a byte at offset 0) stays the loaded bound: LLVM
+               turns a compare against a constant with trailing ones into a
+               shift and a compare against a small one, an instruction more
+               in every loop it would have been hoisted from. */
+            if (fixed_size && fixed_size <= UINT32_MAX
+                && (offset + bytes > 1
+                    || strncmp(comp_ctx->target_arch, "riscv", 5))) {
+                limit = I32_CONST((uint32)(fixed_size - offset - bytes));
+                comp_ctx->fixed_memory_bound_used = true;
             }
-            if (!(limit = LLVMBuildNUWSub(
-                      comp_ctx->builder, mem_check_bound,
-                      I32_CONST((uint32)(offset + bytes - 1)), "limit"))) {
-                aot_set_last_error("llvm build sub failed.");
-                goto fail;
+            else {
+                if (!(mem_check_bound =
+                          get_memory_check_bound(comp_ctx, func_ctx, 1))) {
+                    goto fail;
+                }
+                if (!(limit = LLVMBuildNUWSub(
+                          comp_ctx->builder, mem_check_bound,
+                          I32_CONST((uint32)(offset + bytes - 1)), "limit"))) {
+                    aot_set_last_error("llvm build sub failed.");
+                    goto fail;
+                }
             }
             BUILD_ICMP(LLVMIntUGT, addr, limit, cmp, "cmp");
 

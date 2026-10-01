@@ -224,6 +224,27 @@ aot_target_has_misaligned_access(const AOTCompContext *comp_ctx)
     return false;
 }
 
+/*
+ * The size of a memory the module defines with its maximum equal to its
+ * initial size, unshared: it cannot grow, whatever memory.grow asks. 0 for
+ * any other memory, or none.
+ */
+uint64
+aot_fixed_memory_size(const AOTCompContext *comp_ctx)
+{
+    WASMModule *module = comp_ctx->comp_data->wasm_module;
+    WASMMemory *memory;
+
+    if (module->import_memory_count != 0 || module->memory_count == 0)
+        return 0;
+    memory = &module->memories[0];
+    if ((memory->flags & SHARED_MEMORY_FLAG)
+        || !(memory->flags & MAX_PAGE_COUNT_FLAG)
+        || memory->max_page_count != memory->init_page_count)
+        return 0;
+    return (uint64)memory->num_bytes_per_page * memory->init_page_count;
+}
+
 unsigned int
 aot_estimate_stack_usage_for_function_call(const AOTCompContext *comp_ctx,
                                            const AOTFuncType *callee_func_type)
@@ -1220,15 +1241,9 @@ create_memory_info(const AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     WASMModule *module = comp_ctx->comp_data->wasm_module;
     WASMFunction *func = module->functions[func_index];
     LLVMTypeRef bound_check_type;
-    /* A memory the module defines with its maximum equal to its initial
-       size cannot grow, whatever memory.grow asks, so its base and bound
-       hold for the instance's life. */
-    bool fixed_size_memory =
-        module->import_memory_count == 0 && module->memory_count > 0
-        && !(module->memories[0].flags & SHARED_MEMORY_FLAG)
-        && (module->memories[0].flags & MAX_PAGE_COUNT_FLAG)
-        && module->memories[0].max_page_count
-               == module->memories[0].init_page_count;
+    /* A memory that cannot grow keeps its base and bound for the instance's
+       life. */
+    bool fixed_size_memory = aot_fixed_memory_size(comp_ctx) > 0;
     bool mem_space_unchanged =
         (!func->has_op_memory_grow && !func->has_op_func_call)
         || (!module->possible_memory_grow) || fixed_size_memory;
