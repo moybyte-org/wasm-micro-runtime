@@ -177,6 +177,37 @@ trunc_sat_float_to_int(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
         return true;
     }
 
+    if (aot_target_trunc_saturates(comp_ctx) && dest_type == I32_TYPE
+        && src_type == F32_TYPE) {
+        /* TRUNC.S already clamps a value past either end of the range to
+           that end, and UTRUNC.S one above it; what is left is a NaN (0,
+           where TRUNC.S gives INT32_MAX) and, unsigned, a value below 0. */
+        LLVMTypeRef param_types[2] = { F32_TYPE, I32_TYPE };
+        LLVMValueRef conv, keep;
+
+        if (!(conv = aot_call_llvm_intrinsic(
+                  comp_ctx, func_ctx,
+                  sign ? "llvm.xtensa.xt.trunc.s" : "llvm.xtensa.xt.utrunc.s",
+                  I32_TYPE, param_types, 2, operand, I32_ZERO))) {
+            aot_set_last_error("llvm build conversion failed.");
+            goto fail;
+        }
+        if (sign)
+            keep = LLVMBuildFCmp(comp_ctx->builder, LLVMRealORD, operand,
+                                 operand, "is_ordered");
+        else
+            keep = LLVMBuildFCmp(comp_ctx->builder, LLVMRealOGE, operand,
+                                 F32_CONST(0.0f), "is_nonneg");
+        if (!keep
+            || !(res = LLVMBuildSelect(comp_ctx->builder, keep, conv,
+                                       I32_ZERO, "sat"))) {
+            aot_set_last_error("llvm build select failed.");
+            goto fail;
+        }
+        PUSH_I32(res);
+        return true;
+    }
+
     if (!(res =
               call_fcmp_intrinsic(comp_ctx, func_ctx, FLOAT_UNO, LLVMRealUNO,
                                   operand, operand, src_type, "fcmp_is_nan"))) {

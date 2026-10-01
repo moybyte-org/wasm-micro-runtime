@@ -683,6 +683,9 @@ aot_target_precheck_can_use_musttail(const AOTCompContext *comp_ctx);
 bool
 aot_target_has_misaligned_access(const AOTCompContext *comp_ctx);
 
+bool
+aot_target_trunc_saturates(const AOTCompContext *comp_ctx);
+
 LLVMValueRef
 aot_direct_call_target(AOTCompContext *comp_ctx, uint32 index);
 

@@ -245,6 +245,21 @@ aot_fixed_memory_size(const AOTCompContext *comp_ctx)
     return (uint64)memory->num_bytes_per_page * memory->init_page_count;
 }
 
+/*
+ * return if the target's float-to-int conversions clamp a value past either
+ * end of the range to that end, which is most of what wasm's saturating
+ * conversions ask. Measured on an ESP32-S3: TRUNC.S gives INT32_MIN and
+ * INT32_MAX past the ends and INT32_MAX for a NaN of either sign; UTRUNC.S
+ * gives UINT32_MAX above the range and for a NaN, and for a value below 0
+ * neither 0 nor anything a clamp would give.
+ */
+bool
+aot_target_trunc_saturates(const AOTCompContext *comp_ctx)
+{
+    return !strcmp(comp_ctx->target_arch, "xtensa") && comp_ctx->target_cpu
+           && !strcmp(comp_ctx->target_cpu, "esp32s3");
+}
+
 unsigned int
 aot_estimate_stack_usage_for_function_call(const AOTCompContext *comp_ctx,
                                            const AOTFuncType *callee_func_type)
